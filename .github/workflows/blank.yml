@@ -2,15 +2,13 @@ name: Toyota catalog daily
 
 on:
   schedule:
-    # 12:00 UTC = 09:00 America/Argentina/Buenos_Aires
-    - cron: "0 12 * * *"
-  workflow_dispatch: {}  # permite dispararlo manualmente
+    - cron: "0 12 * * *"  # 09:00 AR
+  workflow_dispatch: {}
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -29,9 +27,23 @@ jobs:
         run: |
           python -m playwright install chromium --with-deps
 
-      - name: Write service_account.json from secret
+      - name: Write service_account.json (raw JSON, guarded)
+        env:
+          SA_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
         run: |
-          echo "${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}" > service_account.json
+          if [ -z "$SA_JSON" ]; then
+            echo "::error::Secret GOOGLE_SERVICE_ACCOUNT_JSON no está seteado o llegó vacío."
+            exit 1
+          fi
+          printf '%s' "$SA_JSON" > service_account.json
+          python - << 'PY'
+import json,sys,os
+p='service_account.json'
+if not os.path.exists(p) or os.path.getsize(p)==0:
+    print('ERROR: service_account.json no existe o está vacío'); sys.exit(1)
+json.load(open(p,'r',encoding='utf-8'))
+print('service_account.json OK')
+PY
 
       - name: Run scraper
         env:
