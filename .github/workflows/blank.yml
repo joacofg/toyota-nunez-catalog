@@ -9,6 +9,7 @@ jobs:
   scrape:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -36,14 +37,7 @@ jobs:
             exit 1
           fi
           printf '%s' "$SA_JSON" > service_account.json
-          python - << 'PY'
-import json,sys,os
-p='service_account.json'
-if not os.path.exists(p) or os.path.getsize(p)==0:
-    print('ERROR: service_account.json no existe o está vacío'); sys.exit(1)
-json.load(open(p,'r',encoding='utf-8'))
-print('service_account.json OK')
-PY
+          python -c "import json,sys,os; p='service_account.json'; open(p,'r',encoding='utf-8').read() and json.load(open(p,'r',encoding='utf-8')); print('service_account.json OK')"
 
       - name: Run scraper
         env:
