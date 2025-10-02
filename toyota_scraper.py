@@ -34,57 +34,45 @@ def is_version_line(s: str) -> bool:
 
 # ---------- utilidades de página ---------- #
 def accept_cookies(page):
-    # OneTrust (muy común)
     for sel in ["#onetrust-accept-btn-handler", "button#onetrust-accept-btn-handler"]:
         try:
-            if page.locator(sel).is_visible():
-                page.click(sel, timeout=1500)
+            el = page.locator(sel)
+            if el.count() and el.first.is_visible():
+                el.first.click(timeout=1200)
                 return
         except: pass
-    # Genérico por texto
     for txt in ["Aceptar", "Aceptar todas", "Aceptar todo", "Accept all", "Aceptar cookies"]:
         try:
             page.get_by_role("button", name=re.compile(txt, re.I)).click(timeout=1200)
             return
         except: pass
 
-def auto_scroll(page, max_steps=20, step_px=1400, delay=0.25):
-    last_h = 0
+def auto_scroll_until(page, predicate_xpath: str, max_steps=30, step_px=1600, delay=0.25):
+    """Scrollea y chequea si aparece el selector XPATH. Devuelve True si aparece."""
     for _ in range(max_steps):
+        # ¿ya está?
+        if page.locator(predicate_xpath).count() > 0:
+            return True
         page.evaluate(f"window.scrollBy(0, {step_px});")
         time.sleep(delay)
-        h = page.evaluate("document.documentElement.scrollHeight")
-        if h == last_h:
-            break
-        last_h = h
-
-def wait_for_ver_modelo(page, timeout=10000):
-    try:
-        page.wait_for_selector("//a[normalize-space()='Ver modelo']", timeout=timeout)
-        return True
-    except:
-        return False
+    return page.locator(predicate_xpath).count() > 0
 
 # ---------- discovery ---------- #
 def discover_models(page):
-    """Lee /modelos y arma [(Tipo, URL_modelo), ...] con robustez (cookies, scroll, geoloc)."""
+    """Lee /modelos y arma [(Tipo, URL_modelo), ...] robusto (sin networkidle)."""
     print(f"[DISCOVERY] Navegando índice {MODELOS}")
+    # cargar DOM y scripts, sin esperar networkidle
     page.goto(MODELOS, timeout=120000, wait_until="domcontentloaded")
+    page.wait_for_load_state("domcontentloaded")
+    page.set_default_timeout(60000)  # subimos el default
+
     time.sleep(0.6)
     accept_cookies(page)
-    # muchos bloques cargan on-scroll
-    auto_scroll(page, max_steps=24, step_px=1600, delay=0.25)
-    page.wait_for_load_state("networkidle")
 
-    if not wait_for_ver_modelo(page, timeout=8000):
-        # intento final: scroll a tope y reintentar
-        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        time.sleep(0.8)
-        wait_for_ver_modelo(page, timeout=5000)
-
-    # si aun así no aparecen, logueo para diagnosticar
+    # Muchos bloques cargan on-scroll. Hacemos scroll + chequeo de 'Ver modelo'
+    has_links = auto_scroll_until(page, "//a[normalize-space()='Ver modelo']", max_steps=40)
     anchors_global = page.locator("//a[normalize-space()='Ver modelo']")
-    print(f"[DISCOVERY] Anclas globales 'Ver modelo': {anchors_global.count()}")
+    print(f"[DISCOVERY] Anclas globales 'Ver modelo': {anchors_global.count()}  (has_links={has_links})")
 
     found = []
     # 1) método por categorías (preferido)
@@ -104,7 +92,7 @@ def discover_models(page):
             if p.netloc.endswith("toyota.com.ar") and p.path.startswith("/modelos/"):
                 found.append((cat, u))
 
-    # 2) fallback: si no encontró nada por categorías, tomo todos los 'Ver modelo'
+    # 2) fallback: si no encontró nada por categorías, tomar todos los 'Ver modelo'
     if not found and anchors_global.count():
         print("[DISCOVERY] Fallback: tomando anchors globales")
         for i in range(anchors_global.count()):
@@ -113,7 +101,7 @@ def discover_models(page):
             u = urljoin(BASE, href)
             p = urlparse(u)
             if p.netloc.endswith("toyota.com.ar") and p.path.startswith("/modelos/"):
-                # intento descubrir el heading h2/h3 más cercano hacia arriba
+                # intentar heading más cercano hacia arriba
                 try:
                     tipo = anchors_global.nth(i).evaluate("""
                         (el) => {
@@ -136,7 +124,6 @@ def discover_models(page):
                 except:
                     tipo = ""
                 tipo = clean(tipo) or "Desconocido"
-                # normalizo si coincide con categorías conocidas
                 tipo2 = next((c for c in CATEGORIES if c.lower() in tipo.lower()), tipo)
                 found.append((tipo2, u))
 
@@ -147,6 +134,14 @@ def discover_models(page):
             seen.add(u); out.append((cat,u))
 
     print(f"[DISCOVERY] Modelos encontrados: {len(out)}")
+    if not out:
+        # Dump mínimo para debug en Actions (primeros 1000 chars de body)
+        try:
+            body = page.content()
+            print("[DISCOVERY][DEBUG] Body len:", len(body))
+            print("[DISCOVERY][DEBUG] Body head:", body[:1000].replace("\n"," ")[:1000])
+        except: pass
+
     for t,u in out: print(" -", t, u)
     return out
 
@@ -284,7 +279,6 @@ def write_sheet_service_account(rows, sheet_id, tab_name, sa_json_path):
 def main():
     all_rows=[]
     with sync_playwright() as p:
-        # contexto con geolocalización y locale argentinos
         browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
         context = browser.new_context(
             locale="es-AR",
@@ -296,6 +290,7 @@ def main():
                         "(KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36 DarwinAI-Scraper")
         )
         page = context.new_page()
+        page.set_default_timeout(60000)  # más margen
 
         targets = discover_models(page)
         for tipo, url in targets:
