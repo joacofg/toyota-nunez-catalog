@@ -5,7 +5,7 @@ from playwright.sync_api import sync_playwright
 # ====== CONFIG ======
 SHEET_ID   = os.environ.get("SHEET_ID", "1AoTq1ZeJLsyFnIFiqPZZXxjYdJocW2FvigtAqkOFvX4")
 SHEET_TAB  = os.environ.get("SHEET_TAB", "ToyotaCatalogo")
-SA_JSON    = os.environ.get("SA_JSON_PATH", "service_account.json")
+SA_JSON    = os.environ.get("SERVICE_ACCOUNT_JSON", "service_account.json")
 BASE       = "https://www.toyota.com.ar"
 MODELOS    = f"{BASE}/modelos"
 
