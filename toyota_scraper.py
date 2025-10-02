@@ -1,6 +1,7 @@
+# toyota_scraper.py (CORREGIDO)
 import os, re, time, pandas as pd
 from urllib.parse import urljoin, urlparse
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, Page
 
 # ====== CONFIG ======
 SHEET_ID   = os.environ.get("SHEET_ID", "1AoTq1ZeJLsyFnIFiqPZZXxjYdJocW2FvigtAqkOFvX4")
@@ -165,6 +166,27 @@ def discover_models(page):
     return out2
 
 # ---------- scraping de ficha ---------- #
+# <<< MODIFICADO >>>
+def get_model_name(page: Page) -> str:
+    """Extrae el nombre del modelo de la página (ej: 'Corolla Cross')."""
+    # Intento 1: Título principal H1
+    try:
+        h1 = page.locator("h1").first
+        if h1.is_visible():
+            name = clean(h1.inner_text())
+            # A veces el H1 tiene texto extra, lo limpiamos
+            if len(name) < 30: return name
+    except:
+        pass
+    
+    # Intento 2: Título de la página
+    title = clean(page.title().split("|")[0])
+    # Evitar títulos genéricos
+    if "Toyota" not in title and len(title) > 2:
+        return title
+        
+    return "Modelo Desconocido"
+
 def get_price(page):
     # 1) bloque cercano (evitando 'Legales')
     try:
@@ -210,9 +232,14 @@ def get_price(page):
 
 def get_pdf(page):
     try:
+        # Priorizar PDFs que contengan "ficha" en el nombre
+        for a in page.locator("a[href*='ficha' i][href$='.pdf']").all():
+             href = a.get_attribute("href")
+             if href: return urljoin(BASE, href)
+        # Fallback a cualquier PDF
         for a in page.locator("a[href$='.pdf']").all():
             href = a.get_attribute("href")
-            if href: return href
+            if href: return urljoin(BASE, href)
     except: pass
     return ""
 
@@ -237,6 +264,10 @@ def scrape_model(page, tipo, url):
     page.goto(url, timeout=120000, wait_until="domcontentloaded")
     time.sleep(0.2)
     accept_cookies(page)
+
+    # <<< MODIFICADO >>> Extraer el nombre del modelo
+    model_name = get_model_name(page)
+    print(f"   -> Modelo detectado: '{model_name}'")
 
     # intentar ubicar seccion de versiones (si existe)
     try:
@@ -265,20 +296,25 @@ def scrape_model(page, tipo, url):
     rows = []
 
     if versions:
-        for i, ver in versions:
+        for i, ver_raw in versions:
             try:
                 nodes.nth(i).scroll_into_view_if_needed()
-                nodes.nth(i).click(timeout=1200)  # si selecciona la card, a veces aparece el precio específico
+                nodes.nth(i).click(timeout=1200)
             except: pass
             price = get_price(page)
-            print(f"   - {ver} | ${price or 'NO_PRICE'}")
-            rows.append([tipo, "Toyota", ver, price, "ARS", ficha, difs, url, ""])
+            
+            # <<< MODIFICADO >>> Limpiar el texto de la versión y armar la fila correcta
+            # Remover el nombre del modelo del string de versión si está presente
+            ver_clean = re.sub(model_name, "", ver_raw, flags=re.I).strip()
+            if not ver_clean: ver_clean = ver_raw # Si queda vacío, usar el original
+            
+            print(f"   - {ver_clean} | ${price or 'NO_PRICE'}")
+            rows.append([tipo, model_name, ver_clean, price, "ARS", ficha, difs, url, ""])
     else:
         # sin versiones: registro igual el modelo
         price = get_price(page)
-        titulo = clean(page.title().split("|")[0]) or "Modelo"
-        print(f"   (sin versiones) {titulo} | ${price or 'NO_PRICE'}")
-        rows.append([tipo, "Toyota", "-", price, "ARS", ficha, difs, url, ""])  # Versión="-"
+        print(f"   (sin versiones) {model_name} | ${price or 'NO_PRICE'}")
+        rows.append([tipo, model_name, "-", price, "ARS", ficha, difs, url, ""])
 
     return rows
 
@@ -321,7 +357,10 @@ def main():
 
         targets = discover_models(page)
         for tipo, url in targets:
-            all_rows += scrape_model(page, tipo, url)
+            try:
+                all_rows += scrape_model(page, tipo, url)
+            except Exception as e:
+                print(f"[ERROR] Falló el scrapeo de {url}: {e}")
 
         context.close()
         browser.close()
@@ -331,7 +370,12 @@ def main():
     try:
         pylocale.setlocale(pylocale.LC_TIME, "es_AR.utf8")
     except:
-        pass
+        # Fallback a un locale que probablemente exista
+        try:
+             pylocale.setlocale(pylocale.LC_TIME, "es_ES.utf8")
+        except:
+            print("[WARN] No se pudo setear el locale a es_AR ni es_ES.")
+            pass
     mes = datetime.datetime.now().strftime("%b-%Y").title()
 
     # DataFrame y filtro final
