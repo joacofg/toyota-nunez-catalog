@@ -9,11 +9,35 @@ SA_JSON    = os.environ.get("SA_JSON_PATH", "service_account.json")
 BASE       = "https://www.toyota.com.ar"
 MODELOS    = f"{BASE}/modelos"
 
-# Guardar CSV al lado del script
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CSV_OUT    = os.path.join(SCRIPT_DIR, "toyota_catalogo.csv")
 
 CATEGORIES = ["Autos","Pick-Up","SUV","Comercial","Deportivos","Híbridos"]
+
+# Mapa de slugs -> categoría (fallback si no encuentro heading)
+CATEGORY_MAP = {
+    "yaris-hatchback": "Autos",
+    "corolla": "Autos",
+    "corolla-gr-sport": "Deportivos",
+    "corolla-hybrid": "Híbridos",
+    "corolla-cross": "SUV",
+    "corolla-cross-gr-sport": "Deportivos",
+    "corolla-cross-hybrid": "Híbridos",
+    "rav4": "SUV",
+    "land-cruiser-300": "SUV",
+    "sw4": "SUV",
+    "sw4-diamond": "SUV",
+    "sw4-gr-sport": "Deportivos",
+    "hiace-furgon": "Comercial",
+    "hiace-commuter": "Comercial",
+    "hiace-wagon": "Comercial",
+    "gr86": "Deportivos",
+    "gr-yaris": "Deportivos",
+    "hilux-dxsr": "Pick-Up",
+    "hilux-srvsrx": "Pick-Up",
+    "hilux-gr-sport": "Deportivos",
+    "crown": "Autos",
+}
 
 # Heurística de “línea de versión”
 VERSION_OK = re.compile(
@@ -39,111 +63,106 @@ def accept_cookies(page):
             el = page.locator(sel)
             if el.count() and el.first.is_visible():
                 el.first.click(timeout=1200)
+                print("[DISCOVERY] Cookies aceptadas (OneTrust).")
                 return
         except: pass
     for txt in ["Aceptar", "Aceptar todas", "Aceptar todo", "Accept all", "Aceptar cookies"]:
         try:
             page.get_by_role("button", name=re.compile(txt, re.I)).click(timeout=1200)
+            print("[DISCOVERY] Cookies aceptadas por texto.")
             return
         except: pass
 
-def auto_scroll_until(page, predicate_xpath: str, max_steps=30, step_px=1600, delay=0.25):
-    """Scrollea y chequea si aparece el selector XPATH. Devuelve True si aparece."""
+def auto_scroll(page, max_steps=36, step_px=1600, delay=0.25):
+    last_h = 0
     for _ in range(max_steps):
-        # ¿ya está?
-        if page.locator(predicate_xpath).count() > 0:
-            return True
         page.evaluate(f"window.scrollBy(0, {step_px});")
         time.sleep(delay)
-    return page.locator(predicate_xpath).count() > 0
+        h = page.evaluate("document.documentElement.scrollHeight")
+        if h == last_h:
+            break
+        last_h = h
 
 # ---------- discovery ---------- #
 def discover_models(page):
-    """Lee /modelos y arma [(Tipo, URL_modelo), ...] robusto (sin networkidle)."""
+    """Devuelve lista [(Tipo, URL_modelo)] robusta sin depender solo de 'Ver modelo'."""
     print(f"[DISCOVERY] Navegando índice {MODELOS}")
-    # cargar DOM y scripts, sin esperar networkidle
     page.goto(MODELOS, timeout=120000, wait_until="domcontentloaded")
-    page.wait_for_load_state("domcontentloaded")
-    page.set_default_timeout(60000)  # subimos el default
-
+    page.set_default_timeout(45000)
     time.sleep(0.6)
     accept_cookies(page)
+    auto_scroll(page, max_steps=40)
 
-    # Muchos bloques cargan on-scroll. Hacemos scroll + chequeo de 'Ver modelo'
-    has_links = auto_scroll_until(page, "//a[normalize-space()='Ver modelo']", max_steps=40)
-    anchors_global = page.locator("//a[normalize-space()='Ver modelo']")
-    print(f"[DISCOVERY] Anclas globales 'Ver modelo': {anchors_global.count()}  (has_links={has_links})")
-
-    found = []
-    # 1) método por categorías (preferido)
+    # 1) Intento por categorías (heading h2/h3 más cercano hacia arriba)
+    out = []
     for cat in CATEGORIES:
         anchors = page.locator(
-            f"xpath=//a[normalize-space()='Ver modelo' and "
+            f"xpath=//a[starts-with(@href,'/modelos/') and "
             f"preceding::*[self::h2 or self::h3][1][normalize-space()='{cat}']]"
         )
         cnt = anchors.count()
         if cnt:
-            print(f"[DISCOVERY] {cat}: {cnt} modelos")
+            print(f"[DISCOVERY] {cat}: {cnt} anchors /modelos/")
         for i in range(cnt):
             href = anchors.nth(i).get_attribute("href") or ""
-            if not href: continue
             u = urljoin(BASE, href)
             p = urlparse(u)
             if p.netloc.endswith("toyota.com.ar") and p.path.startswith("/modelos/"):
-                found.append((cat, u))
+                out.append((cat, u))
 
-    # 2) fallback: si no encontró nada por categorías, tomar todos los 'Ver modelo'
-    if not found and anchors_global.count():
-        print("[DISCOVERY] Fallback: tomando anchors globales")
-        for i in range(anchors_global.count()):
-            href = anchors_global.nth(i).get_attribute("href") or ""
-            if not href: continue
-            u = urljoin(BASE, href)
-            p = urlparse(u)
-            if p.netloc.endswith("toyota.com.ar") and p.path.startswith("/modelos/"):
-                # intentar heading más cercano hacia arriba
-                try:
-                    tipo = anchors_global.nth(i).evaluate("""
-                        (el) => {
-                          let n = el;
-                          while (n) {
-                            let p = n.previousElementSibling;
-                            while (p) {
-                              if (p.tagName && (p.tagName.toLowerCase()==='h2' || p.tagName.toLowerCase()==='h3')) {
-                                return p.textContent.trim();
-                              }
-                              const h = p.querySelector && p.querySelector('h2,h3');
-                              if (h) return h.textContent.trim();
-                              p = p.previousElementSibling;
-                            }
-                            n = n.parentElement;
-                          }
-                          return '';
-                        }
-                    """)
-                except:
-                    tipo = ""
-                tipo = clean(tipo) or "Desconocido"
-                tipo2 = next((c for c in CATEGORIES if c.lower() in tipo.lower()), tipo)
-                found.append((tipo2, u))
+    # 2) Fallback global: tomar TODOS los a[href^="/modelos/"] visibles
+    anchors_all = page.locator("a[href^='/modelos/']")
+    total_all = anchors_all.count()
+    print(f"[DISCOVERY] Fallback pool total a[href^='/modelos/']: {total_all}")
+    for i in range(total_all):
+        href = anchors_all.nth(i).get_attribute("href") or ""
+        u = urljoin(BASE, href)
+        p = urlparse(u)
+        if not (p.netloc.endswith("toyota.com.ar") and p.path.startswith("/modelos/")):
+            continue
+        # si ya lo tengo por categorías, skip
+        if any(u == u2 for _, u2 in out):
+            continue
+        # inferir tipo por heading más cercano
+        try:
+            tipo = anchors_all.nth(i).evaluate("""
+                (el) => {
+                  let n = el;
+                  while (n) {
+                    let p = n.previousElementSibling;
+                    while (p) {
+                      if (p.tagName && (p.tagName.toLowerCase()==='h2' || p.tagName.toLowerCase()==='h3')) {
+                        return p.textContent.trim();
+                      }
+                      const h = p.querySelector && p.querySelector('h2,h3');
+                      if (h) return h.textContent.trim();
+                      p = p.previousElementSibling;
+                    }
+                    n = n.parentElement;
+                  }
+                  return '';
+                }
+            """)
+        except:
+            tipo = ""
+        tipo = clean(tipo)
+        if not tipo:
+            # por slug
+            slug = p.path.split("/")[-1]
+            tipo = CATEGORY_MAP.get(slug, "Desconocido")
+        # normalizar si coincide con categorías conocidas
+        tipo2 = next((c for c in CATEGORIES if c.lower() in tipo.lower()), tipo or "Desconocido")
+        out.append((tipo2, u))
 
     # quitar duplicados manteniendo orden
-    seen, out = set(), []
-    for cat,u in found:
+    seen, out2 = set(), []
+    for cat,u in out:
         if u not in seen:
-            seen.add(u); out.append((cat,u))
+            seen.add(u); out2.append((cat,u))
 
-    print(f"[DISCOVERY] Modelos encontrados: {len(out)}")
-    if not out:
-        # Dump mínimo para debug en Actions (primeros 1000 chars de body)
-        try:
-            body = page.content()
-            print("[DISCOVERY][DEBUG] Body len:", len(body))
-            print("[DISCOVERY][DEBUG] Body head:", body[:1000].replace("\n"," ")[:1000])
-        except: pass
-
-    for t,u in out: print(" -", t, u)
-    return out
+    print(f"[DISCOVERY] Modelos encontrados: {len(out2)}")
+    for t,u in out2: print(" -", t, u)
+    return out2
 
 # ---------- scraping de ficha ---------- #
 def get_price(page):
@@ -219,11 +238,13 @@ def scrape_model(page, tipo, url):
     time.sleep(0.2)
     accept_cookies(page)
 
+    # intentar ubicar seccion de versiones (si existe)
     try:
         page.get_by_text("Encontrá tu versión", exact=False).scroll_into_view_if_needed()
     except: pass
     time.sleep(0.2)
 
+    # nodos que podrían contener nombre de versión
     nodes = page.locator(
         "xpath=//*[self::button or self::a or self::div]"
         "[contains(., 'CVT') or contains(., 'AT') or contains(., 'MT') or contains(., 'HEV') or contains(., '4x') or contains(., 'AWD')]"
@@ -247,17 +268,17 @@ def scrape_model(page, tipo, url):
         for i, ver in versions:
             try:
                 nodes.nth(i).scroll_into_view_if_needed()
-                nodes.nth(i).click(timeout=1200)
+                nodes.nth(i).click(timeout=1200)  # si selecciona la card, a veces aparece el precio específico
             except: pass
             price = get_price(page)
             print(f"   - {ver} | ${price or 'NO_PRICE'}")
             rows.append([tipo, "Toyota", ver, price, "ARS", ficha, difs, url, ""])
     else:
+        # sin versiones: registro igual el modelo
         price = get_price(page)
-        titulo = clean(page.title().split("|")[0])
+        titulo = clean(page.title().split("|")[0]) or "Modelo"
         print(f"   (sin versiones) {titulo} | ${price or 'NO_PRICE'}")
-        if price:
-            rows.append([tipo, "Toyota", titulo, price, "ARS", ficha, difs, url, ""])
+        rows.append([tipo, "Toyota", "-", price, "ARS", ficha, difs, url, ""])  # Versión="-"
 
     return rows
 
@@ -276,6 +297,12 @@ def write_sheet_service_account(rows, sheet_id, tab_name, sa_json_path):
         ws.append_rows(rows, value_input_option="RAW")
     print(f"[SHEETS] Escribí {len(rows)} filas en {sheet_id}/{tab_name}")
 
+def keep_row(version_text: str) -> bool:
+    # Conservo si es versión válida o si es “-” (modelo sin versiones)
+    if version_text.strip() == "-":
+        return True
+    return is_version_line(version_text)
+
 def main():
     all_rows=[]
     with sync_playwright() as p:
@@ -290,7 +317,7 @@ def main():
                         "(KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36 DarwinAI-Scraper")
         )
         page = context.new_page()
-        page.set_default_timeout(60000)  # más margen
+        page.set_default_timeout(45000)
 
         targets = discover_models(page)
         for tipo, url in targets:
@@ -299,10 +326,24 @@ def main():
         context.close()
         browser.close()
 
+    # MesVigencia MMM-YYYY (local AR)
+    import datetime, locale as pylocale
+    try:
+        pylocale.setlocale(pylocale.LC_TIME, "es_AR.utf8")
+    except:
+        pass
+    mes = datetime.datetime.now().strftime("%b-%Y").title()
+
+    # DataFrame y filtro final
     df = pd.DataFrame(all_rows, columns=[
         "Tipo","Modelo","Versión","PrecioSugerido","Moneda","FichaTecnicaURL","Diferenciales","ModeloURL","MesVigencia"
     ])
-    df = df[df["Versión"].apply(is_version_line)]
+    df["MesVigencia"] = mes
+
+    before = len(df)
+    df = df[df["Versión"].apply(keep_row)]
+    after = len(df)
+    print(f"[FILTER] Filas antes: {before} | después: {after}")
 
     # CSV local para debug
     df.to_csv(CSV_OUT, index=False, encoding="utf-8")
