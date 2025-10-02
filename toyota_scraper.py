@@ -3,11 +3,15 @@ from urllib.parse import urljoin, urlparse
 from playwright.sync_api import sync_playwright
 
 # ====== CONFIG ======
-SHEET_ID   = os.environ.get("SHEET_ID", "1AoTq1ZeJLsyFnIFiqPZZXxjYdJocW2FvigtAqkOFvX4")   # <-- poné tu Sheet ID
+SHEET_ID   = os.environ.get("SHEET_ID", "1AoTq1ZeJLsyFnIFiqPZZXxjYdJocW2FvigtAqkOFvX4")
 SHEET_TAB  = os.environ.get("SHEET_TAB", "ToyotaCatalogo")
 SA_JSON    = os.environ.get("SA_JSON_PATH", "service_account.json")
 BASE       = "https://www.toyota.com.ar"
 MODELOS    = f"{BASE}/modelos"
+
+# Guardar CSV al lado del script
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CSV_OUT    = os.path.join(SCRIPT_DIR, "toyota_catalogo.csv")
 
 CATEGORIES = ["Autos","Pick-Up","SUV","Comercial","Deportivos","Híbridos"]
 
@@ -30,17 +34,12 @@ def is_version_line(s: str) -> bool:
 
 def discover_models(page):
     """Lee https://www.toyota.com.ar/modelos y arma [(Tipo, URL_modelo), ...]"""
+    print(f"[DISCOVERY] Navegando índice {MODELOS}")
     page.goto(MODELOS, timeout=120000)
     page.wait_for_load_state("domcontentloaded")
 
     found = []
     for cat in CATEGORIES:
-        # Encuentro el heading por nombre exacto
-        h = page.get_by_role("heading", name=cat, exact=True)
-        if not h or h.count() == 0:
-            continue
-        # Tomo todos los anchors “Ver modelo” cuyo heading previo sea 'cat'
-        # XPATH: el <a> cuyo texto sea 'Ver modelo' y cuyo <h2> inmediatamente anterior tenga ese texto.
         anchors = page.locator(
             f"xpath=//a[normalize-space()='Ver modelo' and "
             f"preceding::*[self::h2 or self::h3][1][normalize-space()='{cat}']]"
@@ -49,31 +48,65 @@ def discover_models(page):
             href = anchors.nth(i).get_attribute("href") or ""
             if not href:
                 continue
-            # solo internos /modelos/...
             u = urljoin(BASE, href)
             p = urlparse(u)
             if p.netloc.endswith("toyota.com.ar") and p.path.startswith("/modelos/"):
                 found.append((cat, u))
 
-    # quitar duplicados manteniendo orden
     seen, out = set(), []
     for cat,u in found:
         if u not in seen:
             seen.add(u); out.append((cat,u))
+    print(f"[DISCOVERY] Modelos encontrados: {len(out)}")
+    for t,u in out: print(" -", t, u)
     return out
 
 def get_price(page):
-    blk = page.get_by_text("Precio sugerido al público", exact=False).locator("xpath=..")
+    # 1) Primer bloque válido (sin “Legales”)
     try:
-        txt = blk.inner_text(timeout=5000)
-    except:
-        txt = page.locator("body").inner_text()
-    m = re.search(r"\$\s*([\d\.\,]+)", txt)
-    if m: return m.group(1)
-    # Fallback global
-    alltxt = page.locator("body").inner_text()
-    m = re.search(r"Precio sugerido al público.*?\$\s*([\d\.\,]+)", alltxt, re.I|re.S)
-    return m.group(1) if m else ""
+        blk = page.locator(
+            "xpath=(//*[contains(normalize-space(),'Precio sugerido al público') "
+            "and not(ancestor::*[contains(.,'Legales')])])[1]"
+            "/ancestor::*[self::div or self::section][1]"
+        )
+        txt = blk.inner_text(timeout=2500)
+        m = re.search(r"\$\s*([\d\.\,]+)", txt)
+        if m: return m.group(1)
+    except Exception:
+        pass
+
+    # 2) Fallback: nodo con '$' luego del texto
+    try:
+        node = page.locator(
+            "xpath=(//*[contains(normalize-space(),'Precio sugerido al público')])[1]"
+            "/following::*[contains(.,'$')][1]"
+        )
+        txt = node.inner_text(timeout=1500)
+        m = re.search(r"\$\s*([\d\.\,]+)", txt)
+        if m: return m.group(1)
+    except Exception:
+        pass
+
+    # 3) Clases comunes
+    try:
+        css_nodes = page.locator("div[class*='styles_price'], div[class*='styles_info-container']")
+        for i in range(min(4, css_nodes.count())):
+            t = css_nodes.nth(i).inner_text(timeout=800)
+            m = re.search(r"\$\s*([\d\.\,]+)", t)
+            if m: return m.group(1)
+    except Exception:
+        pass
+
+    # 4) Bruto
+    try:
+        body = page.locator("body").inner_text()
+        body = re.sub(r"Legales[\s\S]+", "", body, flags=re.I)
+        m = re.search(r"\$\s*([\d\.\,]{5,})", body)
+        if m: return m.group(1)
+    except Exception:
+        pass
+
+    return ""
 
 def get_pdf(page):
     for a in page.locator("a[href$='.pdf']").all():
@@ -95,15 +128,14 @@ def get_difs(page):
     return " · ".join(out)
 
 def scrape_model(page, tipo, url):
+    print(f"\n[MODEL] {tipo} :: {url}")
     page.goto(url, timeout=120000)
     page.wait_for_load_state("domcontentloaded")
     modelo = clean(page.title().split("|")[0])
 
-    # Ir hasta “Encontrá tu versión”
     try:
         page.get_by_text("Encontrá tu versión", exact=False).scroll_into_view_if_needed()
-    except:
-        pass
+    except: pass
     time.sleep(0.2)
 
     nodes = page.locator(
@@ -115,6 +147,9 @@ def scrape_model(page, tipo, url):
     for i in range(n):
         t = clean(nodes.nth(i).inner_text())
         if is_version_line(t):
+            # fix duplicado GR Yaris
+            if "GR YARIS AT GR YARIS MT" in t:
+                t = "GR YARIS AT/MT"
             k = t.lower()
             if k not in seen:
                 seen.add(k); versions.append((i, t))
@@ -122,14 +157,20 @@ def scrape_model(page, tipo, url):
     ficha = get_pdf(page)
     difs  = get_difs(page)
     rows = []
-    for i, ver in versions:
-        try:
-            nodes.nth(i).scroll_into_view_if_needed()
-            nodes.nth(i).click(timeout=1500)
-        except:
-            pass
+    if versions:
+        for i, ver in versions:
+            try:
+                nodes.nth(i).scroll_into_view_if_needed()
+                nodes.nth(i).click(timeout=1500)
+            except: pass
+            price = get_price(page)
+            print(f"   - {ver} | ${price or 'NO_PRICE'}")
+            rows.append([tipo, "Toyota", ver, price, "ARS", ficha, difs, url, ""])
+    else:
         price = get_price(page)
-        rows.append([tipo, "Toyota", ver, price, "ARS", ficha, difs, url, ""])
+        print(f"   (sin versiones) {modelo} | ${price or 'NO_PRICE'}")
+        if price:
+            rows.append([tipo, "Toyota", modelo, price, "ARS", ficha, difs, url, ""])
     return rows
 
 # ====== Google Sheets (Service Account) ======
@@ -145,24 +186,27 @@ def write_sheet_service_account(rows, sheet_id, tab_name, sa_json_path):
     ws.append_row(header)
     if rows:
         ws.append_rows(rows, value_input_option="RAW")
+    print(f"[SHEETS] Escribí {len(rows)} filas en {sheet_id}/{tab_name}")
 
 def main():
     all_rows=[]
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
         page = browser.new_page()
-        # 1) Descubrir modelos desde /modelos
         targets = discover_models(page)
-        # 2) Scrape de cada ficha
         for tipo, url in targets:
             all_rows += scrape_model(page, tipo, url)
         browser.close()
 
-    # filtro defensivo
     df = pd.DataFrame(all_rows, columns=[
         "Tipo","Modelo","Versión","PrecioSugerido","Moneda","FichaTecnicaURL","Diferenciales","ModeloURL","MesVigencia"
     ])
     df = df[df["Versión"].apply(is_version_line)]
+
+    # CSV local para debug
+    df.to_csv(CSV_OUT, index=False, encoding="utf-8")
+    print(f"[CSV] Guardado {os.path.abspath(CSV_OUT)} con {len(df)} filas")
+
     write_sheet_service_account(df.values.tolist(), SHEET_ID, SHEET_TAB, SA_JSON)
 
 if __name__ == "__main__":
